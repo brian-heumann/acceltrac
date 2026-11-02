@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AccelTrac – Accelerometer Visualizer</title>
+<style>
+:root{--bg:#0a0e16;--panel:#111827;--line:#1e293b;--ink:#e6edf7;--mute:#8793a8;--x:#ff5d73;--y:#4cd69b;--z:#5aa9ff;--gold:#ffc857}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font:14px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+body{display:flex;flex-direction:column;overflow:hidden}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:8px 18px;padding:9px 14px;background:var(--panel);border-bottom:1px solid var(--line)}
+h1{font-size:15px;margin:0;letter-spacing:.04em}
+h1 span{color:var(--gold)}
+.badge{font-size:12px;padding:2px 8px;border-radius:99px;background:#1b2538;color:var(--mute)}
+.badge.live{background:#12382a;color:#6ff0b4}
+label{display:flex;align-items:center;gap:8px;color:var(--mute);font-size:12px}
+input[type=range]{width:120px;accent-color:var(--gold)}
+label b{color:var(--ink);font-variant-numeric:tabular-nums;min-width:52px}
+button{background:#1d2a44;color:var(--ink);border:1px solid #2c3d62;border-radius:8px;padding:6px 12px;font:inherit;cursor:pointer}
+button:hover{background:#25365a}
+#note{color:#ffb454;font-size:12px}
+.stage{position:relative;flex:1;min-height:0}
+.spec{position:relative;height:34%;min-height:170px;border-top:1px solid var(--line);background:#0c121d}
+canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+#scene{cursor:grab;touch-action:none}
+#scene:active{cursor:grabbing}
+.hud{position:absolute;left:14px;top:12px;font:13px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;pointer-events:none;text-shadow:0 1px 4px #000}
+.hud i{font-style:normal;display:inline-block;width:2.2em}
+.hud .mute{color:var(--mute)}
+.hint{position:absolute;right:14px;top:12px;color:var(--mute);font-size:12px;pointer-events:none}
+</style>
+</head>
+<body>
+<header>
+  <h1>ACCEL<span>TRAC</span></h1>
+  <span class="badge" id="mode">Simulation</span>
+  <button id="btnSensor">Use phone sensor</button>
+  <label>Shake frequency <input type="range" id="sf" min="1" max="15" step="0.1" value="3.2"><b id="sfv">3.2 Hz</b></label>
+  <label>Intensity <input type="range" id="sa" min="1" max="10" step="0.1" value="5"><b id="sav">5.0 m/s²</b></label>
+  <span id="note"></span>
+</header>
+<div class="stage">
+  <canvas id="scene"></canvas>
+  <div class="hud">
+    <div><i style="color:var(--x)">X</i><span id="hx">0.00</span> <span class="mute">m/s²</span></div>
+    <div><i style="color:var(--y)">Y</i><span id="hy">0.00</span> <span class="mute">m/s²</span></div>
+    <div><i style="color:var(--z)">Z</i><span id="hz">0.00</span> <span class="mute">m/s²</span></div>
+    <div><i style="color:var(--gold)">|a|</i><span id="hm">0.00</span> <span class="mute">m/s² (gravity removed)</span></div>
+  </div>
+  <div class="hint">drag to orbit · gold ribbon = motion over time</div>
+</div>
+<div class="spec"><canvas id="spec"></canvas></div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const scene = $('#scene'), sctx = scene.getContext('2d');
+const spec = $('#spec'), pctx = spec.getContext('2d');
+let W = 0, H = 0, PW = 0, PH = 0;
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  for (const [c, ctx] of [[scene, sctx], [spec, pctx]]) {
+    const r = c.getBoundingClientRect();
+    c.width = Math.max(1, r.width * dpr); c.height = Math.max(1, r.height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  const a = scene.getBoundingClientRect(), b = spec.getBoundingClientRect();
+  W = a.width; H = a.height; PW = b.width; PH = b.height;
+}
+addEventListener('resize', resize);
+
+/* ---------- signal state ---------- */
+const FS = 50, N = 256, NF = 1024;          // analysis rate (Hz), window length, FFT size
+const buf = { t: [], x: [], y: [], z: [] };  // linear acceleration (gravity removed)
+let g = [0, 0, 9.81], gInit = false, lastT = 0, lin = [0, 0, 0];
+let mode = 'sim', simF = 3.2, simAmp = 5, simT = null, simPhase = 0, gotSensor = false;
+const IOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
+
+function resetSignal() {
+  buf.t.length = buf.x.length = buf.y.length = buf.z.length = 0;
+  gInit = false; simT = null; lin = [0, 0, 0];
+}
+
+function pushRaw(t, rx, ry, rz) {            // raw = accelerometer incl. gravity
+  if (!gInit) { g = [rx, ry, rz]; gInit = true; lastT = t; }
+  const dt = Math.max(t - lastT, 1e-3); lastT = t;
+  const k = 1 - Math.exp(-dt / 0.35);        // low-pass = gravity estimate
+  g[0] += (rx - g[0]) * k; g[1] += (ry - g[1]) * k; g[2] += (rz - g[2]) * k;
+  lin = [rx - g[0], ry - g[1], rz - g[2]];
+  buf.t.push(t); buf.x.push(lin[0]); buf.y.push(lin[1]); buf.z.push(lin[2]);
+  while (buf.t.length && t - buf.t[0] > 8) { buf.t.shift(); buf.x.shift(); buf.y.shift(); buf.z.shift(); }
+}
+
+function simStep(now) {                      // synthetic phone being shaken + slowly tilted
+  if (simT === null || now - simT > 0.5) simT = now - 0.01;
+  while (simT < now) {
+    const t = simT;
+    simPhase += 2 * Math.PI * simF * 0.01;
+    const s = Math.sin(simPhase) + 0.3 * Math.sin(2 * simPhase + 1.1) + 0.12 * Math.sin(3 * simPhase + 2);
+    const r = 0.6 * Math.sin(0.23 * t + 1), p = 0.45 * Math.sin(0.31 * t);
+    const gx = Math.sin(r) * Math.cos(p), gy = Math.sin(p), gz = Math.cos(r) * Math.cos(p);
+    const n = () => (Math.random() - 0.5) * 0.4;
+    pushRaw(t, 9.81 * gx + simAmp * 0.8 * s + n(), 9.81 * gy + simAmp * 0.5 * s + n(), 9.81 * gz + simAmp * 0.35 * s + n());
+    simT += 0.01;
+  }
+}
+
+/* ---------- real sensor ---------- */
+function onMotion(e) {
+  const a = e.accelerationIncludingGravity;
+  if (!a || a.x == null) return;
+  gotSensor = true;
+  const s = IOS ? -1 : 1;                    // iOS reports the opposite sign
+  pushRaw(performance.now() / 1000, s * a.x, s * a.y, s * a.z);
+}
+function setMode(m) {
+  mode = m; resetSignal();
+  $('#mode').textContent = m === 'sensor' ? 'Live sensor' : 'Simulation';
+  $('#mode').classList.toggle('live', m === 'sensor');
+  $('#btnSensor').textContent = m === 'sensor' ? 'Back to simulation' : 'Use phone sensor';
+  $('#sf').disabled = $('#sa').disabled = m === 'sensor';
+}
+$('#btnSensor').onclick = async () => {
+  const note = $('#note'); note.textContent = '';
+  if (mode === 'sensor') { removeEventListener('devicemotion', onMotion); setMode('sim'); return; }
+  try {
+    if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+      if (await DeviceMotionEvent.requestPermission() !== 'granted') {
+        note.textContent = window.self !== window.top
+          ? 'Blocked: this page is embedded in a frame that disallows motion sensors. Open it as a standalone HTTPS page (e.g. GitHub Pages / Netlify).'
+          : 'Motion permission denied – in Safari: Settings > Safari > Motion & Orientation Access, then reload.';
+        return;
+      }
+    }
+  } catch (e) { note.textContent = 'Motion permission unavailable here.'; return; }
+  gotSensor = false; setMode('sensor');
+  addEventListener('devicemotion', onMotion);
+  setTimeout(() => {
+    if (mode === 'sensor' && !gotSensor) {
+      removeEventListener('devicemotion', onMotion); setMode('sim');
+      note.textContent = 'No accelerometer data here (desktop, or sensors blocked by this page frame) – staying on simulation.';
+    }
+  }, 1500);
+};
+$('#sf').oninput = e => { simF = +e.target.value; $('#sfv').textContent = simF.toFixed(1) + ' Hz'; };
+$('#sa').oninput = e => { simAmp = +e.target.value; $('#sav').textContent = simAmp.toFixed(1) + ' m/s²'; };
+
+/* ---------- FFT / base frequency ---------- */
+const hann = new Float64Array(N); let hsum = 0;
+for (let i = 0; i < N; i++) { hann[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (N - 1)); hsum += hann[i]; }
+
+function fft(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = -2 * Math.PI / len, wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let k = 0; k < len / 2; k++) {
+        const a = i + k, b = a + len / 2;
+        const tr = re[b] * cr - im[b] * ci, ti = re[b] * ci + im[b] * cr;
+        re[b] = re[a] - tr; im[b] = im[a] - ti; re[a] += tr; im[a] += ti;
+        const nr = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = nr;
+      }
+    }
+  }
+}
+
+function resample(arr, tEnd) {
+  const T = buf.t, out = new Float64Array(N); let j = 0;
+  for (let i = 0; i < N; i++) {
+    const tt = tEnd - (N - 1 - i) / FS;
+    if (tt < T[0]) { out[i] = NaN; continue; }
+    while (j < T.length - 2 && T[j + 1] < tt) j++;
+    const u = Math.min(Math.max((tt - T[j]) / ((T[j + 1] - T[j]) || 1), 0), 1);
+    out[i] = arr[j] + (arr[j + 1] - arr[j]) * u;
+  }
+  return out;
+}
+
+const NBIN = NF / 2, DF = FS / NF;
+const amp = new Float64Array(NBIN);          // combined amplitude spectrum (m/s²)
+let f0 = null, f0s = 0, rms = 0;
+
+function analyze() {
+  if (buf.t.length < 10) { amp.fill(0); f0 = null; return; }
+  const tEnd = buf.t[buf.t.length - 1], p2 = new Float64Array(NBIN); rms = 0;
+  for (const arr of [buf.x, buf.y, buf.z]) {
+    const s = resample(arr, tEnd); let m = 0, c = 0;
+    for (const v of s) if (v === v) { m += v; c++; }
+    m /= Math.max(c, 1);
+    const re = new Float64Array(NF), im = new Float64Array(NF);
+    let q = 0;
+    for (let i = 0; i < N; i++) { const v = s[i] === s[i] ? s[i] - m : 0; re[i] = v * hann[i]; q += v * v; }
+    rms += q / N;
+    fft(re, im);
+    for (let k = 0; k < NBIN; k++) p2[k] += re[k] * re[k] + im[k] * im[k];
+  }
+  rms = Math.sqrt(rms);
+  for (let k = 0; k < NBIN; k++) amp[k] = 2 * Math.sqrt(p2[k]) / hsum;
+  // peak between 0.8 and 24 Hz
+  let best = -1, bk = 0;
+  for (let k = Math.ceil(0.8 / DF); k < Math.floor(24 / DF); k++) if (amp[k] > best) { best = amp[k]; bk = k; }
+  if (rms < 0.3 || best <= 0) { f0 = null; return; }
+  const a = amp[bk - 1], b = amp[bk], c = amp[bk + 1], d = a - 2 * b + c;
+  const off = d !== 0 ? 0.5 * (a - c) / d : 0;         // parabolic interpolation
+  f0 = (bk + Math.max(-0.5, Math.min(0.5, off))) * DF;
+  f0s = f0s ? f0s + (f0 - f0s) * 0.2 : f0;
+}
+
+/* ---------- 3D ---------- */
+let yaw = -0.65, pitch = 0.42;
+const DIST = 6.4, FLOOR = -1.35;
+let F = 600;
+let drag = null;
+scene.addEventListener('pointerdown', e => { drag = [e.clientX, e.clientY]; scene.setPointerCapture(e.pointerId); });
+scene.addEventListener('pointermove', e => {
+  if (!drag) return;
+  yaw += (e.clientX - drag[0]) * 0.008;
+  pitch = Math.max(-0.2, Math.min(1.45, pitch + (e.clientY - drag[1]) * 0.008));
+  drag = [e.clientX, e.clientY];
+});
+scene.addEventListener('pointerup', () => drag = null);
+
+function toCam(p) {
+  const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const x1 = cy * p[0] + sy * p[2], z1 = -sy * p[0] + cy * p[2];
+  return [x1, cp * p[1] - sp * z1, DIST - (sp * p[1] + cp * z1)];
+}
+function proj(p) { const c = toCam(p), s = F / c[2]; return [W / 2 + c[0] * s, H * 0.53 - c[1] * s, c[2]]; }
+
+const M = v => [v[0], v[2], -v[1]];          // device frame (x right, y top, z out of screen) -> world (y up)
+function rotTo(u) {                          // minimal rotation taking unit vector u onto world up (0,1,0)
+  const ax = [-u[2], 0, u[0]], c = u[1];     // axis = u × up
+  if (c < -0.9999) return [[1, 0, 0], [0, -1, 0], [0, 0, -1]];
+  const k = 1 / (1 + c), [x, y, z] = ax;
+  return [
+    [1 - k * (y * y + z * z), -z + k * x * y, y + k * x * z],
+    [z + k * x * y, 1 - k * (x * x + z * z), -x + k * y * z],
+    [-y + k * x * z, x + k * y * z, 1 - k * (x * x + y * y)]
+  ];
+}
+const mul = (R, v) => [R[0][0] * v[0] + R[0][1] * v[1] + R[0][2] * v[2], R[1][0] * v[0] + R[1][1] * v[1] + R[1][2] * v[2], R[2][0] * v[0] + R[2][1] * v[1] + R[2][2] * v[2]];
+const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const scl = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+
+const HX = 0.4, HY = 0.8, HZ = 0.05;
+const CORNER = i => [(i & 1 ? 1 : -1) * HX, (i & 2 ? 1 : -1) * HY, (i & 4 ? 1 : -1) * HZ];
+const FACES = [ // [corner indices, device normal, base rgb]
+  [[4, 5, 7, 6], [0, 0, 1], [38, 50, 80]],
+  [[0, 2, 3, 1], [0, 0, -1], [64, 74, 98]],
+  [[1, 3, 7, 5], [1, 0, 0], [118, 128, 150]],
+  [[0, 4, 6, 2], [-1, 0, 0], [118, 128, 150]],
+  [[2, 6, 7, 3], [0, 1, 0], [118, 128, 150]],
+  [[0, 1, 5, 4], [0, -1, 0], [118, 128, 150]]
+];
+const LIGHT = (() => { const l = [-0.4, 0.85, 0.5], n = Math.hypot(...l); return l.map(v => v / n); })();
+const rgb = (c, b) => `rgb(${Math.min(255, c[0] * b) | 0},${Math.min(255, c[1] * b) | 0},${Math.min(255, c[2] * b) | 0})`;
+const trail = [];
+
+function poly(pts, fill, stroke) {
+  sctx.beginPath(); pts.forEach((p, i) => i ? sctx.lineTo(p[0], p[1]) : sctx.moveTo(p[0], p[1])); sctx.closePath();
+  if (fill) { sctx.fillStyle = fill; sctx.fill(); }
+  if (stroke) { sctx.strokeStyle = stroke; sctx.lineWidth = 1; sctx.stroke(); }
+}
+function line(a, b, color, w, dash) {
+  const p = proj(a), q = proj(b);
+  sctx.setLineDash(dash || []); sctx.strokeStyle = color; sctx.lineWidth = w; sctx.lineCap = 'round';
+  sctx.beginPath(); sctx.moveTo(p[0], p[1]); sctx.lineTo(q[0], q[1]); sctx.stroke(); sctx.setLineDash([]);
+}
+function arrow(a, b, color, w) {
+  if (Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]) < 0.02) return;
+  line(a, b, color, w);
+  const p = proj(a), q = proj(b), ang = Math.atan2(q[1] - p[1], q[0] - p[0]), h = 8 + w * 2;
+  sctx.fillStyle = color; sctx.beginPath(); sctx.moveTo(q[0], q[1]);
+  sctx.lineTo(q[0] - h * Math.cos(ang - 0.4), q[1] - h * Math.sin(ang - 0.4));
+  sctx.lineTo(q[0] - h * Math.cos(ang + 0.4), q[1] - h * Math.sin(ang + 0.4)); sctx.closePath(); sctx.fill();
+}
+
+function drawScene(now) {
+  F = Math.min(H * 1.7, W * 1.15);
+  sctx.clearRect(0, 0, W, H);
+  const bg = sctx.createRadialGradient(W / 2, H * 0.55, 10, W / 2, H * 0.55, Math.max(W, H) * 0.7);
+  bg.addColorStop(0, '#16213a'); bg.addColorStop(1, '#0a0e16');
+  sctx.fillStyle = bg; sctx.fillRect(0, 0, W, H);
+
+  // floor grid
+  for (let i = -4; i <= 4; i++) {
+    const a = 1 - Math.abs(i) / 5.5;
+    line([i * 0.6, FLOOR, -2.4], [i * 0.6, FLOOR, 2.4], `rgba(120,150,210,${0.22 * a})`, 1);
+    line([-2.4, FLOOR, i * 0.6], [2.4, FLOOR, i * 0.6], `rgba(120,150,210,${0.22 * a})`, 1);
+  }
+
+  // orientation from gravity
+  const gn = Math.hypot(g[0], g[1], g[2]) || 1;
+  const gw = M([g[0] / gn, g[1] / gn, g[2] / gn]);
+  const R = rotTo(gw);
+  const toW = v => mul(R, M(v));
+  const offset = scl(toW(lin), 0.045);
+  const mag = Math.hypot(lin[0], lin[1], lin[2]);
+
+  // shadow
+  const sh = [];
+  for (let i = 0; i < 28; i++) { const a = i / 28 * Math.PI * 2; sh.push(proj([offset[0] + Math.cos(a) * 0.62, FLOOR, offset[2] + Math.sin(a) * 0.62])); }
+  poly(sh, 'rgba(0,0,0,0.38)');
+
+  // phone faces, back to front
+  const V = []; for (let i = 0; i < 8; i++) V.push(add(toW(CORNER(i)), offset));
+  const faces = FACES.map(f => {
+    const pts = f[0].map(i => proj(V[i])), n = mul(R, M(f[1]));
+    const d = pts.reduce((s, p) => s + p[2], 0) / 4;
+    return { pts, n, d, c: f[2], isScreen: f === FACES[0], isBack: f === FACES[1] };
+  }).sort((a, b) => b.d - a.d);
+  const act = Math.min(1, mag / 8);
+  for (const f of faces) {
+    const b = 0.5 + 0.7 * Math.max(0, f.n[0] * LIGHT[0] + f.n[1] * LIGHT[1] + f.n[2] * LIGHT[2]);
+    poly(f.pts, rgb(f.c, b), 'rgba(160,190,255,0.35)');
+    if (f.isScreen) {
+      const q = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([sx, sy]) => proj(add(toW([sx * 0.34, sy * 0.74, HZ + 0.003]), offset)));
+      const gr = sctx.createLinearGradient(q[3][0], q[3][1], q[1][0], q[1][1]);
+      gr.addColorStop(0, `hsl(${215 + act * 25},75%,${14 + act * 26}%)`);
+      gr.addColorStop(1, `hsl(${190 - act * 40},70%,${22 + act * 30}%)`);
+      poly(q, gr, 'rgba(255,255,255,0.12)');
+    }
+    if (f.isBack) {
+      const c = proj(add(toW([-0.2, 0.6, -HZ - 0.003]), offset));
+      sctx.fillStyle = '#05080f'; sctx.beginPath(); sctx.arc(c[0], c[1], Math.max(2, F / f.d * 0.07), 0, 7); sctx.fill();
+    }
+  }
+
+  // vectors
+  const C = offset;
+  line(C, add(C, [0, -0.95, 0]), 'rgba(200,210,230,0.55)', 1.5, [4, 4]);          // gravity (down)
+  const cols = ['#ff5d73', '#4cd69b', '#5aa9ff'], axes = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  for (let i = 0; i < 3; i++) {
+    const dir = toW(axes[i]);
+    arrow(C, add(C, scl(dir, lin[i] * 0.16)), cols[i], 3);
+  }
+  arrow(C, add(C, scl(toW(lin), 0.16)), '#ffc857', 4);
+
+  // time ribbon of the phone's displacement
+  trail.push({ t: now, p: scl(offset, 2.2) });
+  while (trail.length && now - trail[0].t > 2.6) trail.shift();
+  sctx.lineWidth = 2.5; sctx.lineCap = 'round';
+  for (let i = 1; i < trail.length; i++) {
+    const a = trail[i - 1], b = trail[i], age = now - b.t;
+    const pa = proj([a.p[0] - (now - a.t) * 0.9 - 0.7, a.p[1] + 1.25, a.p[2]]);
+    const pb = proj([b.p[0] - age * 0.9 - 0.7, b.p[1] + 1.25, b.p[2]]);
+    sctx.strokeStyle = `rgba(255,200,87,${Math.max(0, 1 - age / 2.6) * 0.9})`;
+    sctx.beginPath(); sctx.moveTo(pa[0], pa[1]); sctx.lineTo(pb[0], pb[1]); sctx.stroke();
+  }
+
+  $('#hx').textContent = lin[0].toFixed(2);
+  $('#hy').textContent = lin[1].toFixed(2);
+  $('#hz').textContent = lin[2].toFixed(2);
+  $('#hm').textContent = mag.toFixed(2);
+}
+
+/* ---------- frequency band ---------- */
+const NB = 100, FMAX = FS / 2;               // 100 bands × 0.25 Hz
+const disp = new Float64Array(NB); let scaleMax = 1;
+
+function drawSpec() {
+  const c = pctx; c.clearRect(0, 0, PW, PH);
+  const L = 44, Rr = 16, T = 34, B = 28, w = PW - L - Rr, h = PH - T - B;
+  c.font = '11px system-ui,sans-serif'; c.textBaseline = 'middle';
+
+  // update bars
+  let peak = 0;
+  for (let i = 0; i < NB; i++) {
+    const k0 = Math.floor(i * (FMAX / NB) / DF), k1 = Math.max(k0 + 1, Math.floor((i + 1) * (FMAX / NB) / DF));
+    let v = 0; for (let k = k0; k < k1; k++) v = Math.max(v, amp[k]);
+    disp[i] = Math.max(v, disp[i] * 0.86); peak = Math.max(peak, v);
+  }
+  scaleMax = Math.max(1, scaleMax * 0.992, peak * 1.1);
+
+  // grid + axis
+  c.strokeStyle = '#1b2538'; c.fillStyle = '#6b7890'; c.lineWidth = 1; c.textAlign = 'center';
+  for (let f = 0; f <= FMAX; f++) {
+    const x = L + f / FMAX * w, major = f % 5 === 0;
+    c.beginPath(); c.moveTo(x, T); c.lineTo(x, T + h); c.strokeStyle = major ? '#243049' : '#141c2c'; c.stroke();
+    if (major) c.fillText(f + ' Hz', x, T + h + 14);
+  }
+  c.textAlign = 'right';
+  for (let i = 0; i <= 2; i++) {
+    const y = T + h - i / 2 * h;
+    c.fillText((scaleMax * i / 2).toFixed(1), L - 6, y);
+  }
+
+  // bars
+  const bw = w / NB;
+  for (let i = 0; i < NB; i++) {
+    const v = Math.min(1, disp[i] / scaleMax), bh = Math.pow(v, 0.8) * h;
+    const x = L + i * bw, fc = (i + 0.5) * (FMAX / NB);
+    const hot = f0 !== null && Math.abs(fc - f0s) < 0.3;
+    const gr = c.createLinearGradient(0, T + h, 0, T + h - Math.max(bh, 1));
+    if (hot) { gr.addColorStop(0, '#ff9f1c'); gr.addColorStop(1, '#fff1b8'); }
+    else { gr.addColorStop(0, '#1f4fd8'); gr.addColorStop(1, '#4cc9f0'); }
+    c.fillStyle = gr; c.fillRect(x + 1, T + h - bh, Math.max(1, bw - 2), bh);
+  }
+
+  // base frequency marker + harmonics
+  if (f0 !== null) {
+    const x = L + f0s / FMAX * w;
+    c.setLineDash([5, 4]); c.strokeStyle = '#ffc857'; c.lineWidth = 1.5;
+    c.beginPath(); c.moveTo(x, T - 4); c.lineTo(x, T + h); c.stroke(); c.setLineDash([]);
+    c.fillStyle = 'rgba(255,200,87,.55)'; c.textAlign = 'center';
+    for (let m = 2; m <= 4; m++) {
+      const hx = L + f0s * m / FMAX * w;
+      if (hx < L + w) { c.fillRect(hx - 0.5, T + h - 12, 1.5, 12); c.fillText(m + 'f₀', hx, T + h - 20); }
+    }
+  }
+
+  // titles
+  c.textAlign = 'left'; c.fillStyle = '#8793a8'; c.font = '12px system-ui,sans-serif';
+  c.fillText('FREQUENCY BAND · amplitude (m/s²) per 0.25 Hz', L, 14);
+  c.textAlign = 'right'; c.font = '600 18px system-ui,sans-serif';
+  c.fillStyle = f0 !== null ? '#ffc857' : '#5b6780';
+  c.fillText(f0 !== null ? `Base frequency  ${f0s.toFixed(2)} Hz` : 'Base frequency  — (hold still)', PW - Rr, 15);
+}
+
+/* ---------- loop ---------- */
+function frame() {
+  const now = performance.now() / 1000;
+  if (mode === 'sim') simStep(now);
+  analyze();
+  drawScene(now);
+  drawSpec();
+  requestAnimationFrame(frame);
+}
+resize();
+requestAnimationFrame(frame);
+window.__dbg = () => ({ f0, f0s, rms, lin, g });
+</script>
+</body>
+</html>
